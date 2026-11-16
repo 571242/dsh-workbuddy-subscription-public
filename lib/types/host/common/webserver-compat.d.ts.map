@@ -1,0 +1,1 @@
+{"version":3,"file":"webserver-compat.d.ts","sourceRoot":"","sources":["../../../../src/host/common/webserver-compat.ts"],"names":[],"mappings":"AAAA,MAAM,WAAW,qBAAqB;IACpC,QAAQ,CAAC,IAAI,EAAE,MAAM,CAAA;IACrB,QAAQ,CAAC,IAAI,EAAE,MAAM,GAAG,SAAS,CAAA;IACjC,SAAS,CAAC,IAAI,MAAM,CAAA;CACrB;AAED,wBAAgB,eAAe,CAAC,MAAM,EAAE,qBAAqB,GAAG,MAAM,CAOrE"}

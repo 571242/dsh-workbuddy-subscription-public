@@ -1,0 +1,722 @@
+/**
+ * Wire translation for Google-hosted Anthropic models on Vertex AI: the request
+ * body Vertex accepts, the two endpoint shapes (global and regional), the SSE
+ * event stream it answers with, and the failure envelope it refuses with.
+ *
+ * Everything here is pure: the adapter feeds it bytes and yields the chunks it
+ * returns, so the protocol is testable without a harness or a network.
+ *
+ * Vertex serves Claude through the publisher endpoint rather than Anthropic's
+ * own API, which changes three things this module owns: the path
+ * (`…/publishers/anthropic/models/{model}:streamRawPredict`), a body carrying
+ * `anthropic_version` and no `model` field, and a bearer token instead of an
+ * `x-api-key` header.
+ *
+ * @module dsh-google-vertex/wire
+ */
+import { systemParts as collectSystemParts, takeCounters, toolInput } from './wire-shared.js';
+// The three provider-neutral codes are the harness's own; imported for local use
+// and re-exported so callers keep importing them from here.
+import { CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, QUOTA_EXCEEDED_CODE, } from '@deepseek-ai/dsh-llm';
+export { CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, QUOTA_EXCEEDED_CODE };
+/** Vertex's Anthropic API version marker; required in every request body. */
+const VERTEX_ANTHROPIC_VERSION = 'vertex-2023-10-16';
+/** Endpoint host used when no region is configured. */
+export const DEFAULT_LOCATION = 'global';
+/**
+ * Default bound on the interval between two stream reads, in milliseconds.
+ * Matches the shipped remote adapters (`llm-deepseek/src/common/defaults.ts`).
+ */
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
+/** Largest delay `setTimeout` schedules without clamping it to one millisecond. */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/**
+ * Host for a location. `global` has no region prefix: the documented global
+ * endpoint is `aiplatform.googleapis.com`, and `global-aiplatform…` is not a
+ * host Vertex answers on.
+ * @param location - configured or defaulted region, or `global`.
+ * @returns the origin, without a trailing slash.
+ */
+export function endpointOrigin(location) {
+    return location === DEFAULT_LOCATION
+        ? 'https://aiplatform.googleapis.com'
+        : `https://${location}-aiplatform.googleapis.com`;
+}
+/**
+ * The streaming publisher path for one model.
+ * @param project - Google Cloud project id.
+ * @param location - region, or `global`.
+ * @param model - publisher model id, e.g. `claude-sonnet-4-5`.
+ * @returns the absolute request URL.
+ */
+export function endpointFor(project, location, model) {
+    const path = `/v1/projects/${encodeURIComponent(project)}/locations/${encodeURIComponent(location)}`
+        + `/publishers/anthropic/models/${encodeURIComponent(model)}:streamRawPredict`;
+    return `${endpointOrigin(location)}${path}`;
+}
+/**
+ * One cache breakpoint is only useful where Vertex can store a prefix, which is
+ * every block type this adapter emits: the request never carries the provider's
+ * own non-cacheable blocks.
+ */
+const CACHE_CONTROL = { type: 'ephemeral' };
+/**
+ * Flatten a tool-role message's content to the text Vertex accepts.
+ *
+ * The Gemini route sends a tool result the same way, so this is exported rather
+ * than written twice.
+ */
+export function resultText(blocks) {
+    const parts = [];
+    for (const block of blocks) {
+        if (block.type === 'text' && typeof block.text === 'string')
+            parts.push(block.text);
+        else if (block.type === 'tool-call')
+            parts.push(`[tool call] ${String(block.name)}(${String(block.arguments)})`);
+    }
+    const joined = parts.join('');
+    // An empty tool result is still a result: the provider rejects empty content.
+    return joined.length > 0 ? joined : '(no output)';
+}
+/** Ensure a tool's JSON Schema is one Anthropic accepts. */
+function inputSchema(parameters) {
+    return {
+        type: 'object',
+        ...parameters,
+        properties: typeof parameters['properties'] === 'object' && parameters['properties'] !== null
+            ? parameters['properties']
+            : {},
+    };
+}
+/** Project one non-system harness message onto its wire content. */
+function messageContent(message) {
+    const content = [];
+    for (const block of message.content) {
+        switch (block.type) {
+            case 'text':
+                if (typeof block.text === 'string' && block.text.length > 0)
+                    content.push({ type: 'text', text: block.text });
+                break;
+            case 'tool-call':
+                content.push({
+                    type: 'tool_use',
+                    id: String(block.id),
+                    name: String(block.name),
+                    input: toolInput(String(block.arguments)),
+                });
+                break;
+            default:
+                // Reasoning blocks carry no reusable text: Vertex requires a signed
+                // thinking block to replay one, and this adapter never enables
+                // extended thinking, so a stray block is history from another route.
+                break;
+        }
+    }
+    return content;
+}
+/**
+ * Project one harness `tool`-role message onto the `tool_result` block Vertex
+ * requires in the user turn that follows the assistant's `tool_use`.
+ *
+ * The harness attributes a tool result to the call on the message itself
+ * (`toolCallId`, `isError`); the provider reads both from the block.
+ */
+function toolResultContent(message) {
+    const callId = message.toolCallId;
+    if (callId === undefined || callId.length === 0)
+        return messageContent(message);
+    return [{
+            type: 'tool_result',
+            tool_use_id: callId,
+            content: resultText(message.content),
+            ...message.isError === true ? { is_error: true } : {},
+        }];
+}
+/**
+ * Build the request body for one model call.
+ *
+ * History is projected block by block, consecutive same-role messages are
+ * merged (the provider reads one turn per role), and three cache breakpoints are
+ * placed: end of tools, end of system, and the final block of the conversation.
+ * Those three make the static prefix and every earlier turn cacheable while the
+ * growing tail is re-read.
+ * @param options - the harness request.
+ * @param config - project, location, and default output cap.
+ * @returns the wire body.
+ */
+export function buildRequestBody(options, config) {
+    const messages = [];
+    for (const message of options.messages) {
+        if (message.role === 'system' || message.role === 'developer')
+            continue;
+        const role = message.role === 'assistant' ? 'assistant' : 'user';
+        const content = message.role === 'tool' ? toolResultContent(message) : messageContent(message);
+        if (content.length === 0)
+            continue;
+        const previous = messages.at(-1);
+        if (previous !== undefined && previous.role === role)
+            previous.content.push(...content);
+        else
+            messages.push({ role, content });
+    }
+    const systemParts = collectSystemParts(options);
+    const system = systemParts.map(text => ({ type: 'text', text }));
+    const tools = (options.tools ?? []).map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        input_schema: inputSchema(tool.parameters),
+    }));
+    const lastTool = tools.at(-1);
+    if (lastTool !== undefined)
+        lastTool.cache_control = CACHE_CONTROL;
+    const lastSystem = system.at(-1);
+    if (lastSystem !== undefined)
+        lastSystem.cache_control = CACHE_CONTROL;
+    const lastMessage = messages.at(-1);
+    const lastBlock = lastMessage?.content.at(-1);
+    if (lastBlock !== undefined)
+        lastBlock.cache_control = CACHE_CONTROL;
+    return {
+        anthropic_version: VERTEX_ANTHROPIC_VERSION,
+        stream: true,
+        max_tokens: options.maxTokens ?? config.maxTokens,
+        messages,
+        ...system.length === 0 ? {} : { system },
+        ...tools.length === 0 ? {} : { tools },
+        ...options.temperature === undefined ? {} : { temperature: options.temperature },
+        ...options.stop === undefined || options.stop.length === 0 ? {} : { stop_sequences: [...options.stop] },
+    };
+}
+/**
+ * Map Vertex's usage counters onto harness accounting.
+ *
+ * Vertex splits prompt tokens the way the harness does (`input_tokens` counts
+ * only uncached input, with cache reads and writes reported separately), so the
+ * fields transfer without arithmetic, and the total is their sum.
+ * @param usage - the latest cumulative counters seen on the stream.
+ * @returns disjoint harness counts.
+ */
+export function mapUsage(usage) {
+    const input = usage.input_tokens ?? 0;
+    const output = usage.output_tokens ?? 0;
+    const cacheRead = usage.cache_read_input_tokens ?? 0;
+    const cacheWrite = usage.cache_creation_input_tokens ?? 0;
+    return {
+        inputTokens: input,
+        outputTokens: output,
+        totalTokens: input + output + cacheRead + cacheWrite,
+        ...cacheRead > 0 ? { cacheReadTokens: cacheRead } : {},
+        ...cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {},
+    };
+}
+/**
+ * Map one provider stop reason onto the harness vocabulary.
+ *
+ * `pause_turn` needs no case of its own: it cannot recur here, because this
+ * adapter declares no server-executed tools, so the answer is complete, which
+ * is what the default already reports for any reason the provider adds.
+ * @param reason - the `stop_reason` Vertex reported, if any.
+ * @returns the harness finish reason.
+ */
+export function mapStopReason(reason) {
+    switch (reason) {
+        case 'max_tokens':
+            return { kind: 'max-tokens' };
+        case 'tool_use':
+            return { kind: 'tool-calls' };
+        case 'refusal':
+            return {
+                kind: 'error',
+                failure: { message: 'google-vertex: the model refused to answer', code: 'REFUSAL' },
+            };
+        case 'model_context_window_exceeded':
+            return {
+                kind: 'error',
+                failure: {
+                    message: 'google-vertex: the request exceeded the model context window',
+                    code: CONTEXT_WINDOW_EXCEEDED_CODE,
+                },
+            };
+        default:
+            return { kind: 'stop' };
+    }
+}
+/**
+ * Extract the provider's message, and Google's canonical `status` when the
+ * envelope carries one, from a failure body.
+ */
+function failureDetail(body) {
+    try {
+        const parsed = JSON.parse(body);
+        if (typeof parsed === 'object' && parsed !== null) {
+            const error = parsed['error'];
+            if (typeof error === 'object' && error !== null) {
+                const fields = error;
+                const status = typeof fields['status'] === 'string' ? fields['status'] : '';
+                if (typeof fields['message'] === 'string')
+                    return { message: fields['message'], status };
+            }
+            const message = parsed['message'];
+            if (typeof message === 'string')
+                return { message, status: '' };
+        }
+    }
+    catch {
+        // Not JSON: the raw body is the most specific thing available.
+    }
+    return { message: body.slice(0, 300).replace(/\s+/g, ' ').trim(), status: '' };
+}
+/**
+ * Classify a refused HTTP response.
+ *
+ * Two refusals carry a code of their own because the harness treats them
+ * differently: an oversized request must not be retried, and an exhausted quota
+ * is a capacity problem rather than an invalid one. Google names the quota in
+ * the envelope's `status` (`RESOURCE_EXHAUSTED`), so that is read as well as
+ * the message, exactly as {@link failureForEvent} reads an in-band envelope.
+ * @param status - HTTP status.
+ * @param body - response body text.
+ * @param subject - route description named in the failure.
+ * @param headers - HTTP response headers carrying an optional Retry-After.
+ * @returns the failure to report.
+ */
+export function failureForStatus(status, body, subject, headers) {
+    const detail = failureDetail(body);
+    const message = `google-vertex: ${subject}: HTTP ${status}${detail.message.length > 0 ? `: ${detail.message}` : ''}`;
+    const retry = headers?.get('retry-after')?.trim();
+    const delay = retry === undefined ? NaN : /^\d+(?:\.\d+)?$/u.test(retry)
+        ? Number(retry) * 1000 : /^[A-Za-z]/u.test(retry) ? Date.parse(retry) - Date.now() : NaN;
+    return {
+        message, code: codeForDetail(`${detail.status} ${detail.message}`) ?? codeForStatus(status), status,
+        ...(Number.isFinite(delay) && delay > 0 ? { providerRetryAfterMs: delay } : {}),
+    };
+}
+/**
+ * Canonical code for one HTTP status, shared by a refused response and by an
+ * in-band error envelope naming the same condition numerically.
+ * @param status - HTTP status, or the provider's numeric error code.
+ * @returns the harness code.
+ */
+function codeForStatus(status) {
+    return status === 400 || status === 413 || status === 422
+        ? 'INVALID_REQUEST'
+        : status === 401 || status === 403
+            ? 'AUTH'
+            : status === 404
+                ? 'NOT_FOUND'
+                : status === 408 || status === 504
+                    ? 'TIMEOUT'
+                    : status === 429
+                        ? 'RATE_LIMIT'
+                        : status >= 500
+                            ? 'SERVER'
+                            : 'TRANSPORT';
+}
+/**
+ * Canonical code for a refusal whose own words name a cause.
+ * @param detail - the provider's message or error status text.
+ * @returns the code, or undefined when the text names no special cause.
+ */
+function codeForDetail(detail) {
+    if (/prompt is too long|input (?:is )?too long|maximum context length|context length|too many tokens|exceeds the maximum/i.test(detail)) {
+        return CONTEXT_WINDOW_EXCEEDED_CODE;
+    }
+    if (/RESOURCE_EXHAUSTED|quota/i.test(detail))
+        return QUOTA_EXCEEDED_CODE;
+    return undefined;
+}
+/** Canonical code for Anthropic's named error type. */
+function codeForErrorType(type) {
+    return type === 'overloaded_error'
+        ? 'SERVER'
+        : type === 'rate_limit_error'
+            ? 'RATE_LIMIT'
+            : type === 'authentication_error' || type === 'permission_error'
+                ? 'AUTH'
+                : type === 'invalid_request_error'
+                    ? 'INVALID_REQUEST'
+                    : 'SERVER';
+}
+/**
+ * Canonical code for Google's `{code, message, status}` error envelope, which
+ * classifies exactly as a refused body does: a named cause first, then the
+ * numeric code.
+ * @param fields - the envelope's own members.
+ * @param message - its message, already read.
+ * @returns the harness code.
+ */
+function codeForGoogleError(fields, message) {
+    const status = typeof fields['status'] === 'string' ? fields['status'] : '';
+    const detail = codeForDetail(`${status} ${message}`);
+    return detail ?? codeForStatus(typeof fields['code'] === 'number' ? fields['code'] : 500);
+}
+/**
+ * Classify a stream-level `error` payload.
+ *
+ * Both publishers deliver one mid-stream: Anthropic's envelope names the
+ * condition in `type`, and Google's in a canonical `status` plus a numeric
+ * `code`. A provider error is what turns a mid-stream refusal into a terminal
+ * failure instead of a truncated response.
+ * @param error - the payload's `error` member.
+ * @returns the failure to report.
+ */
+export function failureForEvent(error) {
+    const fields = (typeof error === 'object' && error !== null ? error : {});
+    const message = typeof fields['message'] === 'string' ? fields['message'] : 'the provider reported an error';
+    const type = fields['type'];
+    const code = typeof type === 'string'
+        ? codeForErrorType(type)
+        : codeForGoogleError(fields, message);
+    return { message: `google-vertex: ${message}`, code };
+}
+/**
+ * Decode one SSE record (everything up to a blank line) into its JSON payload.
+ *
+ * `event:` lines are ignored because every Vertex payload carries its own
+ * `type`; `data:` lines are concatenated, which is what the SSE specification
+ * requires for a multi-line payload.
+ * @param record - one raw record, without its trailing blank line.
+ * @returns the parsed payload, or undefined for a comment, ping, or malformed record.
+ */
+export function parseSseRecord(record) {
+    let payload = '';
+    let found = false;
+    const length = record.length;
+    for (let cursor = 0; cursor <= length;) {
+        let end = record.indexOf('\n', cursor);
+        if (end === -1)
+            end = length;
+        if (record.startsWith('data:', cursor)) {
+            const value = record.slice(record.charCodeAt(cursor + 5) === 0x20 ? cursor + 6 : cursor + 5, end);
+            payload = found ? `${payload}\n${value}` : value;
+            found = true;
+        }
+        if (end === length)
+            break;
+        cursor = end + 1;
+    }
+    if (!found || payload.length === 0)
+        return undefined;
+    try {
+        const parsed = JSON.parse(payload);
+        return typeof parsed === 'object' && parsed !== null ? parsed : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Reassembles SSE records from arbitrarily split transport chunks.
+ *
+ * Line endings are normalized as text arrives, so a `\r\n` split across two
+ * chunks still frames one record: a chunk-final CR is carried over and resolved
+ * against the next chunk's first byte rather than normalized chunk by chunk.
+ */
+export class SseBuffer {
+    #buffer = '';
+    /** A trailing CR held back: the next chunk may carry the LF that pairs with it. */
+    #pendingCr = false;
+    /**
+     * Absorb one decoded chunk.
+     * @param text - newly decoded text.
+     * @returns every complete record it completes, in order.
+     */
+    push(text) {
+        // A CR at the end of a chunk cannot be classified yet: it is either the
+        // first half of a CRLF whose LF opens the next chunk, or a lone CR. Holding
+        // it back is what keeps a split CRLF one line ending: normalizing the
+        // chunk on its own would turn the pair into two, framing a phantom record
+        // and cutting a multi-line payload in half.
+        let chunk = text;
+        if (this.#pendingCr) {
+            // The held CR is a line ending either way; its LF, if this chunk opens
+            // with one, is consumed by the pair and not a second ending.
+            chunk = `\n${chunk.startsWith('\n') ? chunk.slice(1) : chunk}`;
+            this.#pendingCr = false;
+        }
+        this.#pendingCr = chunk.endsWith('\r');
+        const content = this.#pendingCr ? chunk.slice(0, -1) : chunk;
+        // The regex engine is only worth starting when the chunk carries a CR; a
+        // body served with bare LF (the common case) is scanned once and kept.
+        this.#buffer += content.includes('\r') ? content.replace(/\r\n?/g, '\n') : content;
+        const records = this.#buffer.split('\n\n');
+        this.#buffer = records.pop() ?? '';
+        return records;
+    }
+    /**
+     * Release whatever a completed body ended with.
+     * @returns the trailing record, or undefined when the body ended on a boundary.
+     */
+    flush() {
+        // A held CR was a lone line ending after all: the body ended before any LF.
+        const rest = this.#pendingCr ? `${this.#buffer}\n` : this.#buffer;
+        this.#buffer = '';
+        this.#pendingCr = false;
+        return rest.trim().length > 0 ? rest : undefined;
+    }
+}
+/**
+ * Frames one streaming response body into SSE records, one transport read at a
+ * time.
+ *
+ * Both publisher routes answer with the same framing and differ only in what
+ * the payload means, so the read loop, the decoder and record buffers, and the
+ * end-of-body flush live here once. The adapter supplies the idle watchdog.
+ *
+ * This is a reader rather than an async generator because a generator costs a
+ * suspended frame, a promise, and a microtask per framed record; the adapter
+ * drives this directly, so a record is framed, parsed, and translated in the
+ * same turn.
+ *
+ * The idle bound covers one outstanding read: it is armed before every read and
+ * cleared as soon as that read resolves: a consumer holding a yielded event is
+ * not a stalled provider. A read that throws is left for the caller to
+ * classify.
+ */
+export class SseRecordReader {
+    #body;
+    #hooks;
+    #buffer = new SseBuffer();
+    #decoder = new TextDecoder();
+    #done = false;
+    /**
+     * @param body - the response body's byte stream.
+     * @param hooks - the caller's idle-watchdog controls.
+     */
+    constructor(body, hooks) {
+        this.#body = body[Symbol.asyncIterator]();
+        this.#hooks = hooks;
+    }
+    /**
+     * Await the next transport read and frame the records it completes.
+     * @returns the records this read completed (an empty array when it completed
+     * none, including the final read that drains the decoder), or undefined once
+     * the body has ended and been drained.
+     */
+    async read() {
+        if (this.#done)
+            return undefined;
+        this.#hooks.armIdle();
+        const next = await this.#body.next();
+        this.#hooks.clearIdle();
+        if (next.done !== true) {
+            return this.#buffer.push(this.#decoder.decode(next.value, { stream: true }));
+        }
+        this.#done = true;
+        // The decoder holds a partial character and the buffer a partial record;
+        // both belong to the body that just ended.
+        const records = this.#buffer.push(this.#decoder.decode());
+        const trailing = this.#buffer.flush();
+        if (trailing !== undefined)
+            records.push(trailing);
+        return records;
+    }
+    /**
+     * Release the body iterator, so a caller that stops early tears down the
+     * transport instead of leaving it reading into a buffer nobody drains.
+     */
+    async close() {
+        if (this.#done)
+            return;
+        this.#done = true;
+        await this.#body.return?.();
+    }
+}
+/** The index of a stream event, or undefined when absent. */
+function eventIndex(event) {
+    const index = event['index'];
+    return typeof index === 'number' && Number.isSafeInteger(index) && index >= 0 ? index : undefined;
+}
+/**
+ * Translate Vertex's Anthropic event stream into harness chunks.
+ *
+ * The translator is stateful because the two protocols disagree about
+ * granularity: Vertex announces a content block and then streams deltas, while
+ * the harness wants a start, the deltas, and an authoritative close. It is
+ * tolerant of the events it does not project (`ping`, thinking, citations,
+ * server tool use), because a provider that adds one must not break the turn.
+ */
+export class StreamTranslator {
+    #blocks = new Map();
+    #usage = {};
+    #usageReported = false;
+    #stopReason;
+    #blocksEmitted = false;
+    #done = false;
+    /**
+     * Feed one decoded event.
+     * @param event - the parsed SSE payload.
+     * @returns the chunks this event completes, in order.
+     */
+    handle(event) {
+        if (this.#done)
+            return [];
+        switch (event['type']) {
+            case 'message_start': {
+                const message = event['message'];
+                if (typeof message === 'object' && message !== null) {
+                    this.#mergeUsage(message['usage']);
+                }
+                return [];
+            }
+            case 'content_block_start':
+                return this.#startBlock(event);
+            case 'content_block_delta':
+                return this.#delta(event);
+            case 'content_block_stop': {
+                const index = eventIndex(event);
+                if (index === undefined)
+                    return [];
+                const partial = this.#blocks.get(index);
+                this.#blocks.delete(index);
+                if (partial === undefined || partial.ignored)
+                    return [];
+                this.#blocksEmitted = true;
+                return [{
+                        type: 'block-end',
+                        index,
+                        block: partial.blockType === 'text'
+                            ? { type: 'text', text: partial.text }
+                            : {
+                                type: 'tool-call',
+                                id: partial.id,
+                                name: partial.name,
+                                arguments: partial.arguments.length > 0 ? partial.arguments : '{}',
+                            },
+                    }];
+            }
+            case 'message_delta': {
+                const delta = event['delta'];
+                if (typeof delta === 'object' && delta !== null) {
+                    const reason = delta['stop_reason'];
+                    if (typeof reason === 'string')
+                        this.#stopReason = reason;
+                }
+                this.#mergeUsage(event['usage']);
+                return [];
+            }
+            case 'message_stop':
+                return this.#finish();
+            case 'error':
+                this.#done = true;
+                return [{ type: 'finish', reason: { kind: 'error', failure: failureForEvent(event['error']) } }];
+            default:
+                return [];
+        }
+    }
+    /** Start one content block, or mark it as one this adapter does not project. */
+    #startBlock(event) {
+        const index = eventIndex(event);
+        const raw = event['content_block'];
+        if (index === undefined || typeof raw !== 'object' || raw === null)
+            return [];
+        const block = raw;
+        switch (block['type']) {
+            case 'text':
+                this.#blocks.set(index, { blockType: 'text', text: '', arguments: '', id: '', name: '', ignored: false });
+                return [{ type: 'block-start', index, blockType: 'text' }];
+            case 'tool_use': {
+                // Vertex streams a tool call as an empty input object followed by
+                // `input_json_delta` fragments; a populated one is a complete call and
+                // any later delta would duplicate it.
+                const input = block['input'];
+                const complete = typeof input === 'object' && input !== null && Object.keys(input).length > 0;
+                const partial = {
+                    blockType: 'tool-call',
+                    text: '',
+                    arguments: complete ? JSON.stringify(input) : '',
+                    id: typeof block['id'] === 'string' && block['id'].length > 0 ? block['id'] : `toolu_${index}`,
+                    name: typeof block['name'] === 'string' ? block['name'] : '',
+                    ignored: false,
+                };
+                this.#blocks.set(index, partial);
+                return [
+                    { type: 'block-start', index, blockType: 'tool-call' },
+                    {
+                        type: 'tool-call-delta',
+                        index,
+                        id: partial.id,
+                        name: partial.name,
+                        argumentsDelta: partial.arguments,
+                    },
+                ];
+            }
+            default:
+                this.#blocks.set(index, { blockType: 'text', text: '', arguments: '', id: '', name: '', ignored: true });
+                return [];
+        }
+    }
+    /** Absorb one content delta. */
+    #delta(event) {
+        const index = eventIndex(event);
+        const raw = event['delta'];
+        if (index === undefined || typeof raw !== 'object' || raw === null)
+            return [];
+        const partial = this.#blocks.get(index);
+        if (partial === undefined || partial.ignored)
+            return [];
+        const delta = raw;
+        switch (delta['type']) {
+            case 'text_delta': {
+                const text = typeof delta['text'] === 'string' ? delta['text'] : '';
+                if (text.length === 0)
+                    return [];
+                partial.text += text;
+                return [{ type: 'text-delta', index, text }];
+            }
+            case 'input_json_delta': {
+                const fragment = typeof delta['partial_json'] === 'string' ? delta['partial_json'] : '';
+                if (fragment.length === 0)
+                    return [];
+                partial.arguments += fragment;
+                return [{ type: 'tool-call-delta', index, id: partial.id, argumentsDelta: fragment }];
+            }
+            default:
+                return [];
+        }
+    }
+    /** Terminal chunks: usage, then the mapped finish reason. */
+    #finish() {
+        this.#done = true;
+        const reason = mapStopReason(this.#stopReason);
+        // A completed turn that produced nothing is a degenerate provider response,
+        // not a successful empty answer; a provider-reported failure keeps its own
+        // reason, which is the more specific account of the same turn.
+        if (!this.#blocksEmitted && reason.kind !== 'error') {
+            return [{
+                    type: 'finish',
+                    reason: {
+                        kind: 'error',
+                        failure: {
+                            message: 'google-vertex: the model completed the response with no content',
+                            code: EMPTY_RESPONSE_CODE,
+                        },
+                    },
+                }];
+        }
+        // Usage accompanies a real provider report; a synthesized zero would claim
+        // a measurement that never happened.
+        return [
+            ...this.#usageReported ? [{ type: 'usage', usage: mapUsage(this.#usage) }] : [],
+            { type: 'finish', reason },
+        ];
+    }
+    /** Merge the newest cumulative usage counters. */
+    #mergeUsage(raw) {
+        const merged = takeCounters(raw, [
+            'input_tokens',
+            'output_tokens',
+            'cache_read_input_tokens',
+            'cache_creation_input_tokens',
+        ]);
+        // Only a counter the provider actually sent counts as a report.
+        if (Object.keys(merged).length === 0)
+            return;
+        this.#usageReported = true;
+        this.#usage = { ...this.#usage, ...merged };
+    }
+    /** True once a terminal event arrived, so the adapter can tell truncation. */
+    get terminal() {
+        return this.#done;
+    }
+}

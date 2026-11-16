@@ -1,0 +1,1 @@
+{"version":3,"file":"KimiCodeSection.d.ts","sourceRoot":"","sources":["../../../../src/client/kimi-code/KimiCodeSection.tsx"],"names":[],"mappings":"AAAA,OAAO,KAAmD,MAAM,OAAO,CAAA;AAsBvE,UAAU,KAAK;IACb,aAAa,CAAC,EAAE,MAAM,IAAI,CAAA;IAC1B,kBAAkB,CAAC,EAAE,MAAM,IAAI,CAAA;CAChC;AAoCD,wBAAgB,eAAe,CAAC,EAAE,aAAa,EAAE,kBAAkB,EAAE,EAAE,KAAK,GAAG,KAAK,CAAC,YAAY,CA6qBhG"}

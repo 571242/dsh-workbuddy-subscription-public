@@ -1,0 +1,9 @@
+node_modules/
+.scratch/
+.studio/
+.env*
+*.dpapi
+*.pem
+*.key
+*.tgz
+backups/
